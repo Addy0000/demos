@@ -1,0 +1,73 @@
+{
+  "name": "mavens-erp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Mavens ERP — operational system of record for a PVC compound manufacturer.",
+  "scripts": {
+    "dev": "next dev -p 3005",
+    "build": "prisma generate && next build",
+    "start": "next start -p 3005",
+    "lint": "eslint src",
+    "typecheck": "tsc --noEmit",
+    "db:up": "docker compose up -d",
+    "db:push": "prisma db push",
+    "db:migrate": "prisma migrate dev",
+    "db:studio": "prisma studio",
+    "db:seed": "tsx prisma/seed.ts",
+    "seed:fin": "tsx prisma/seedFin.ts",
+    "seed:vendors": "tsx prisma/seedVendors.ts",
+    "seed:costing": "tsx prisma/seedCosting.ts",
+    "seed:dispatch": "tsx prisma/seedDispatch.ts",
+    "seed:dashboard": "tsx prisma/seedDashboard.ts",
+    "seed:demo": "tsx prisma/seedDemo.ts",
+    "setup:demo": "prisma generate && tsx prisma/seedDemo.ts --reset",
+    "themes": "python scripts/gen-themes.py",
+    "db:reset": "prisma migrate reset --force",
+    "setup": "docker compose up -d && prisma generate && prisma db push && npm run db:seed",
+    "preview": "opennextjs-cloudflare build && opennextjs-cloudflare preview",
+    "deploy": "opennextjs-cloudflare build && opennextjs-cloudflare deploy"
+  },
+  "prisma": {
+    "seed": "tsx prisma/seed.ts"
+  },
+  "dependencies": {
+    "@opennextjs/cloudflare": "^1.20.16",
+    "@prisma/adapter-pg": "^6.19.3",
+    "@prisma/client": "^6.3.1",
+    "@tanstack/react-virtual": "^3.11.2",
+    "bcryptjs": "^2.4.3",
+    "next": "^16.4.5",
+    "next-auth": "^5.0.0-beta.25",
+    "nodemailer": "^8.0.11",
+    "pg": "^8.23.1",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "server-only": "^0.0.1",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/node": "^22.10.7",
+    "@types/nodemailer": "^6.4.17",
+    "@types/pg": "^8.23.1",
+    "@types/react": "^19.0.7",
+    "@types/react-dom": "^19.0.3",
+    "autoprefixer": "^10.4.20",
+    "eslint": "9.39.5",
+    "eslint-config-next": "16.4.0",
+    "postcss": "^8.5.1",
+    "prisma": "^6.3.1",
+    "tailwindcss": "^3.4.17",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3",
+    "wrangler": "^4.151.2"
+  },
+  "allowScripts": {
+    "prisma@6.19.3": true,
+    "@prisma/client@6.19.3": true,
+    "@prisma/engines@6.19.3": true,
+    "esbuild@0.28.2": true,
+    "sharp@0.34.5": true,
+    "workerd@1.20261019.1": true
+  }
+}

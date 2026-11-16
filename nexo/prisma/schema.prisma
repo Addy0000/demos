@@ -1,0 +1,2795 @@
+// Mavens ERP — PVC compound manufacturing.
+//
+// Shaped around compounding specifically, not generic "items and orders":
+// formulations built from resin/plasticiser/stabiliser/filler/additive, batch and lot
+// traceability from goods receipt through to finished compound, and technical
+// documentation (TDS/SDS/CoA/RoHS/REACH) as first-class records.
+//
+// Money is Decimal(14,4) — never Float. Quantities are Decimal(14,3) (KG precision).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IDENTITY & ACCESS
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum Role {
+  ADMIN
+  MANAGEMENT // director / CEO — reads everything, approves escalations, enters nothing
+  SALES
+  PROJECT_MANAGER
+  FINANCE
+  PURCHASE_EXECUTIVE // raises orders, chases delivery — no approval authority
+  PURCHASE_HEAD // approves up to a value limit, owns vendor master
+  STORE
+  VENDOR // external — scoped to its own vendor record only
+  HR // people operations — employees, attendance, leave, payroll
+}
+
+/// Which level a purchase order must reach to be approved. Derived from its value
+/// when the order is raised, so the routing is fixed at the moment of commitment
+/// and cannot drift if the limits are later changed.
+enum ApprovalTier {
+  HEAD
+  MANAGEMENT
+}
+
+model User {
+  id                  String    @id @default(cuid())
+  email               String    @unique
+  name                String
+  passwordHash        String
+  role                Role
+  jobTitle            String?
+  phone               String?
+  isActive            Boolean   @default(true)
+  lastLoginAt         DateTime?
+  isVerified          Boolean   @default(false)
+  otp                 String?
+  otpExpiresAt        DateTime?
+  resetToken          String?
+  resetTokenExpiresAt DateTime?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  // Set only for role = VENDOR. This is the keyhole: every vendor-scoped query
+  // filters on it, at the data layer, never only in the UI.
+  vendorId String?
+  vendor   Vendor? @relation(fields: [vendorId], references: [id], onDelete: SetNull)
+
+  ownedCustomers  Customer[]      @relation("CustomerOwner")
+  managedProjects Project[]       @relation("ProjectManager")
+  submittedPrices MaterialPrice[] @relation("PriceSubmittedBy")
+  approvedPrices  MaterialPrice[] @relation("PriceApprovedBy")
+  raisedOrders    PurchaseOrder[] @relation("PORaisedBy")
+  approvedOrders  PurchaseOrder[] @relation("POApprovedBy")
+  receivedGrns    GoodsReceipt[]  @relation("GrnReceivedBy")
+  inspectedGrns   GoodsReceipt[]  @relation("GrnInspectedBy")
+
+  raisedRequisitions     PurchaseRequisition[] @relation("PrRaisedBy")
+  approvedRequisitions   PurchaseRequisition[] @relation("PrApprovedBy")
+  raisedInquiries        PurchaseInquiry[]     @relation("PiRaisedBy")
+  selectedQuotations     PurchaseQuotation[]   @relation("PqSelectedBy")
+  raisedRejectionNotes   VendorRejectionNote[] @relation("VrnRaisedBy")
+  approvedRejectionNotes VendorRejectionNote[] @relation("VrnApprovedBy")
+
+  ownedSalesInquiries  SalesInquiry[]    @relation("SiOwner")
+  preparedCostSheets   CostSheet[]       @relation("CsPreparedBy")
+  approvedCostSheets   CostSheet[]       @relation("CsApprovedBy")
+  ownedSalesQuotations SalesQuotation[]  @relation("SqOwner")
+  raisedSalesOrders    SalesOrder[]      @relation("SoRaisedBy")
+  approvedSalesOrders  SalesOrder[]      @relation("SoApprovedBy")
+  stockAllocations     StockAllocation[] @relation("AllocatedBy")
+  raisedChallans       DeliveryChallan[] @relation("DcRaisedBy")
+  raisedInvoices       SalesInvoice[]    @relation("InvRaisedBy")
+  receivedReturns      SalesReturn[]     @relation("SrnReceivedBy")
+  inspectedReturns     SalesReturn[]     @relation("SrnInspectedBy")
+  uploadedDocuments    Document[]        @relation("DocumentUploadedBy")
+  createdBills         VendorBill[]      @relation("BillCreatedBy")
+  creditNotes          CreditNote[]      @relation("CnCreatedBy")
+  debitNotes           DebitNote[]       @relation("DnCreatedBy")
+
+  // Item Management (BOM) relations
+  requestedBoms       StandardBom[]  @relation("BomRequestedBy")
+  approvedBoms        StandardBom[]  @relation("BomApprovedBy")
+  requestedAmendments BomAmendment[] @relation("AmdRequestedBy")
+  approvedAmendments  BomAmendment[] @relation("AmdApprovedBy")
+  employee            Employee?
+  decidedLeaves       LeaveRequest[] @relation("LeaveDecidedBy")
+
+  // Planning (PLN) relations
+  pwoRequests  PlanningWorkOrder[] @relation("PwoRequestedBy")
+  pwoApprovals PlanningWorkOrder[] @relation("PwoApprovedBy")
+
+  // Direct Manufacturing (PRD) relations
+  dmwoOperators DirectManufacturingWorkOrder[] @relation("DmwoOperator")
+  dmwoCreators  DirectManufacturingWorkOrder[] @relation("DmwoCreatedBy")
+  dmwoApprovers DirectManufacturingWorkOrder[] @relation("DmwoApprovedBy")
+  qcVerdicts    QualityControlPlaceholder[]    @relation("QcVerdictBy")
+
+  activities  CustomerActivity[]
+  movements   StockMovement[]
+  auditEvents AuditEvent[]
+
+  @@index([role])
+  @@index([vendorId])
+}
+
+/// Append-only trail. Every approval, price change and stock movement lands here.
+model AuditEvent {
+  id         String   @id @default(cuid())
+  entityType String
+  entityId   String
+  action     String
+  summary    String
+  metadata   Json?
+  actorId    String?
+  actor      User?    @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  createdAt  DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([createdAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CUSTOMER MANAGEMENT
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum CustomerStatus {
+  PROSPECT
+  ACTIVE
+  ON_HOLD
+  DORMANT
+}
+
+enum Industry {
+  WIRE_AND_CABLE
+  FOOTWEAR
+  PIPES_AND_FITTINGS
+  PROFILES
+  MEDICAL
+  AUTOMOTIVE
+  PACKAGING
+  CONSTRUCTION
+  ENGINEERING
+  AGRICULTURE
+  PHARMA
+  FMCG
+  RETAIL
+  HOSPITALITY
+  APPAREL
+  ELECTRICAL
+  INFRASTRUCTURE
+  ENERGY
+  OTHER
+}
+
+model Customer {
+  id        String         @id @default(cuid())
+  code      String         @unique // CUST-0001
+  name      String
+  legalName String?
+  industry  Industry
+  status    CustomerStatus @default(PROSPECT)
+  gstin     String?
+  pan       String?
+
+  addressLine1 String?
+  addressLine2 String?
+  city         String?
+  state        String?
+  pincode      String?
+  country      String  @default("India")
+
+  creditLimit    Decimal @default(0) @db.Decimal(14, 2)
+  creditDays     Int     @default(30)
+  paymentTerms   String?
+  outstandingAmt Decimal @default(0) @db.Decimal(14, 2)
+
+  ownerId String?
+  owner   User?   @relation("CustomerOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+
+  contacts   CustomerContact[]
+  projects   Project[]
+  activities CustomerActivity[]
+
+  salesInquiries  SalesInquiry[]
+  salesQuotations SalesQuotation[]
+  salesOrders     SalesOrder[]
+  challans        DeliveryChallan[]
+  invoices        SalesInvoice[]
+  salesReturns    SalesReturn[]
+  creditNotes     CreditNote[]
+  ledgerPostings  LedgerPosting[]
+  engagements     Engagement[]
+  serviceInvoices ServiceInvoice[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([industry])
+  @@index([name])
+}
+
+model CustomerContact {
+  id         String   @id @default(cuid())
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  name      String
+  role      String?
+  email     String?
+  phone     String?
+  isPrimary Boolean @default(false)
+
+  createdAt DateTime @default(now())
+
+  @@index([customerId])
+}
+
+enum ActivityKind {
+  CALL
+  EMAIL
+  MEETING
+  SAMPLE_SENT
+  QUOTE_SENT
+  COMPLAINT
+  NOTE
+}
+
+model CustomerActivity {
+  id         String   @id @default(cuid())
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  kind       ActivityKind
+  subject    String
+  body       String?
+  occurredAt DateTime     @default(now())
+
+  userId String?
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([customerId, occurredAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PROJECT MANAGEMENT  (compound development)
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum ProjectStage {
+  ENQUIRY
+  FORMULATION
+  LAB_TRIAL
+  SAMPLE_WITH_CUSTOMER
+  PLANT_TRIAL
+  APPROVED
+  IN_PRODUCTION
+  ON_HOLD
+  DROPPED
+}
+
+enum ProjectPriority {
+  CRITICAL
+  HIGH
+  MODERATE
+  LOW
+  PLANNING
+}
+
+model Project {
+  id          String @id @default(cuid())
+  code        String @unique // PRJ-0001
+  name        String
+  application String // "66 kV cable sheathing", "PVC sandal strap"
+
+  stage    ProjectStage    @default(ENQUIRY)
+  priority ProjectPriority @default(MODERATE)
+
+  customerId String?
+  customer   Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+
+  managerId String?
+  manager   User?   @relation("ProjectManager", fields: [managerId], references: [id], onDelete: SetNull)
+
+  // Target technical envelope for the compound under development.
+  targetShoreA        Int?
+  targetSpGravity     Decimal? @db.Decimal(5, 3)
+  targetTensileMpa    Decimal? @db.Decimal(6, 2)
+  targetElongationPct Int?
+  targetVolumeResist  String? // e.g. "1.0 x 10^13 ohm-cm"
+  targetLoiPct        Decimal? @db.Decimal(4, 1)
+  targetTempRating    String? // 70C / 90C / 105C
+  standard            String? // IS 5831 Type A, ASTM D2287, UL 1581 …
+
+  targetPricePerKg  Decimal? @db.Decimal(10, 2)
+  estimatedVolumeMt Decimal? @db.Decimal(10, 2)
+
+  startedAt   DateTime  @default(now())
+  targetDate  DateTime?
+  completedAt DateTime?
+  notes       String?
+
+  formulation  Formulation?
+  documents    Document[]
+  demos        ProductDemo[]
+  requisitions PurchaseRequisition[]
+
+  salesInquiries      SalesInquiry[]
+  salesQuotationLines SalesQuotationLine[]
+  salesOrderLines     SalesOrderLine[]
+  salesReturnLines    SalesReturnLine[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([stage])
+  @@index([priority])
+  @@index([customerId])
+}
+
+model Formulation {
+  id        String  @id @default(cuid())
+  projectId String  @unique
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  version Int     @default(1)
+  basis   Decimal @default(100) @db.Decimal(8, 2) // parts per hundred resin basis
+  notes   String?
+
+  lines      FormulationLine[]
+  costSheets CostSheet[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model FormulationLine {
+  id            String      @id @default(cuid())
+  formulationId String
+  formulation   Formulation @relation(fields: [formulationId], references: [id], onDelete: Cascade)
+
+  materialId String
+  material   RawMaterial @relation(fields: [materialId], references: [id], onDelete: Restrict)
+
+  /// Parts per hundred resin. Resin itself sits at 100.
+  phr      Decimal @db.Decimal(8, 3)
+  sequence Int     @default(0)
+  remark   String?
+
+  @@index([formulationId])
+  @@index([materialId])
+}
+
+enum DocumentType {
+  TDS // Technical Data Sheet
+  SDS // Safety Data Sheet / MSDS
+  COA // Certificate of Analysis
+  ROHS // RoHS declaration
+  REACH // REACH / SVHC declaration
+  SPEC_SHEET
+  TEST_REPORT
+  DRAWING
+  CUSTOMER_SPEC
+  OTHER
+}
+
+/// Typed, revision-tracked. Attaches to a project, a material, or both.
+model Document {
+  id       String       @id @default(cuid())
+  code     String       @unique // DOC-0001
+  title    String
+  type     DocumentType
+  revision String       @default("R0")
+
+  fileName    String
+  mimeType    String  @default("application/pdf")
+  fileSize    Int     @default(0)
+  /// Demo build stores a path, not a blob. Swap for S3/blob storage in production.
+  storagePath String?
+
+  issuedOn  DateTime?
+  expiresOn DateTime?
+  isCurrent Boolean   @default(true)
+
+  projectId String?
+  project   Project? @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  materialId String?
+  material   RawMaterial? @relation(fields: [materialId], references: [id], onDelete: Cascade)
+
+  vendorId String?
+  vendor   Vendor? @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+
+  uploadedById String?
+  uploadedBy   User?   @relation("DocumentUploadedBy", fields: [uploadedById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+
+  @@index([type])
+  @@index([projectId])
+  @@index([materialId])
+  @@index([vendorId])
+}
+
+enum DemoStatus {
+  PLANNED
+  IN_LAB
+  DISPATCHED
+  UNDER_EVALUATION
+  APPROVED
+  REJECTED
+}
+
+/// A physical sample sent to a customer, with the measured result that came back.
+model ProductDemo {
+  id        String  @id @default(cuid())
+  code      String  @unique // DEMO-0001
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  title      String
+  status     DemoStatus @default(PLANNED)
+  batchRef   String?
+  quantityKg Decimal?   @db.Decimal(10, 2)
+
+  dispatchedOn DateTime?
+  courierRef   String?
+  feedbackOn   DateTime?
+  feedback     String?
+
+  // Measured on the sample that actually shipped.
+  measuredShoreA        Int?
+  measuredTensileMpa    Decimal? @db.Decimal(6, 2)
+  measuredElongationPct Int?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([projectId])
+  @@index([status])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MATERIALS & FINANCE  (vendor-maintained price base)
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum MaterialCategory {
+  PVC_RESIN
+  PLASTICISER
+  STABILISER
+  FILLER
+  LUBRICANT
+  PROCESSING_AID
+  IMPACT_MODIFIER
+  FLAME_RETARDANT
+  PIGMENT
+  BLOWING_AGENT
+  STEEL
+  PLATING_CHEMICAL
+  CONSUMABLE
+  PACKAGING
+  SOLVENT
+  INTERMEDIATE
+  FOOD_INGREDIENT
+  FIBRE
+  FABRIC
+  DYE
+  COMPONENT
+  TRADED_GOODS
+  OTHER
+}
+
+enum ItemType {
+  RAW_MATERIAL
+  FINISHED_GOOD
+  SEMI_FINISHED
+}
+
+enum Uom {
+  KG
+  MT
+  LTR
+  NOS
+}
+
+model RawMaterial {
+  id        String           @id @default(cuid())
+  code      String           @unique // RM-0001
+  name      String
+  itemType  ItemType         @default(RAW_MATERIAL)
+  category  MaterialCategory
+  grade     String? // K67, DOP, Ca-Zn 402 …
+  casNumber String?
+  hsnCode   String?
+  uom       Uom              @default(KG)
+
+  /// K-value for resins; null elsewhere.
+  kValue   Int?
+  /// Free-form key spec, e.g. "Sp.Gr 0.985, Acid value 0.07 mgKOH/g".
+  specNote String?
+
+  isHazardous Boolean @default(false)
+  isActive    Boolean @default(true)
+
+  reorderLevelKg Decimal @default(0) @db.Decimal(12, 2)
+  reorderQtyKg   Decimal @default(0) @db.Decimal(12, 2)
+  leadTimeDays   Int     @default(7)
+
+  /// Denormalised from the current approved MaterialPrice — kept in step by the
+  /// approval action, so grids and costing never N+1 across price history.
+  currentPricePerKg Decimal?  @db.Decimal(10, 2)
+  currentPriceFrom  DateTime?
+
+  prices           MaterialPrice[]
+  formulationLines FormulationLine[]
+  poLines          PurchaseOrderLine[]
+  batches          InventoryBatch[]
+  movements        StockMovement[]
+  documents        Document[]
+  vendorLinks      VendorMaterial[]
+
+  requisitionLines PurchaseRequisitionLine[]
+  inquiryLines     PurchaseInquiryLine[]
+  quotationLines   PurchaseQuotationLine[]
+  rejectionLines   VendorRejectionNoteLine[]
+  debitNoteLines   DebitNoteLine[]
+  costSheetLines   CostSheetLine[]
+
+  // Item Management (BOM) relations
+  standardBoms      StandardBom[]
+  standardBomLines  StandardBomLine[]
+  orderBomLines     OrderBomLine[]
+  bomAmendmentLines BomAmendmentLine[]
+
+  // Planning (PLN) relations
+  planningWorkOrders              PlanningWorkOrder[]
+  planningAllocations             PlanningAllocation[]
+  planningShortages               PlanningShortage[]
+  purchaseRequisitionPlaceholders PurchaseRequisitionPlaceholder[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([category])
+  @@index([name])
+  @@index([isActive])
+}
+
+enum PriceStatus {
+  DRAFT
+  PENDING_APPROVAL
+  APPROVED
+  REJECTED
+  SUPERSEDED
+}
+
+/// Versioned, never overwritten. A vendor submits; Finance approves; the previous
+/// approved row is marked SUPERSEDED. This is the audit trail costing depends on.
+model MaterialPrice {
+  id         String      @id @default(cuid())
+  materialId String
+  material   RawMaterial @relation(fields: [materialId], references: [id], onDelete: Cascade)
+
+  vendorId String
+  vendor   Vendor @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+
+  pricePerKg Decimal  @db.Decimal(10, 2)
+  currency   String   @default("INR")
+  /// Price movement vs the row this one supersedes, in percent. Computed on submit.
+  changePct  Decimal? @db.Decimal(6, 2)
+
+  status        PriceStatus @default(PENDING_APPROVAL)
+  effectiveFrom DateTime
+  effectiveTo   DateTime?
+
+  moqKg        Decimal? @db.Decimal(12, 2)
+  leadTimeDays Int?
+  remark       String?
+
+  submittedById String?
+  submittedBy   User?    @relation("PriceSubmittedBy", fields: [submittedById], references: [id], onDelete: SetNull)
+  submittedAt   DateTime @default(now())
+
+  approvedById    String?
+  approvedBy      User?     @relation("PriceApprovedBy", fields: [approvedById], references: [id], onDelete: SetNull)
+  approvedAt      DateTime?
+  rejectionReason String?
+
+  @@index([materialId, status])
+  @@index([vendorId, status])
+  @@index([status, submittedAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PROCUREMENT — vendors, POs, GRN, inventory
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum VendorStatus {
+  ACTIVE
+  ON_HOLD
+  BLACKLISTED
+  PENDING_APPROVAL
+}
+
+model Vendor {
+  id        String       @id @default(cuid())
+  code      String       @unique // VEN-0001
+  name      String
+  legalName String?
+  status    VendorStatus @default(ACTIVE)
+
+  gstin String?
+  pan   String?
+
+  contactName  String?
+  contactEmail String?
+  contactPhone String?
+
+  addressLine1 String?
+  city         String?
+  state        String?
+  pincode      String?
+  country      String  @default("India")
+
+  paymentTerms String?
+  creditDays   Int     @default(30)
+  /// 0–100, from on-time delivery and QC pass rate.
+  rating       Decimal @default(0) @db.Decimal(4, 1)
+
+  users          User[]
+  materials      VendorMaterial[]
+  prices         MaterialPrice[]
+  purchaseOrders PurchaseOrder[]
+  goodsReceipts  GoodsReceipt[]
+  documents      Document[]
+
+  inquiries      PurchaseInquiryVendor[]
+  quotations     PurchaseQuotation[]
+  rejectionNotes VendorRejectionNote[]
+  vendorBills    VendorBill[]
+  debitNotes     DebitNote[]
+  ledgerPostings LedgerPosting[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([name])
+}
+
+/// Which vendor is approved to supply which material. Also bounds what a
+/// vendor user may submit a price for.
+model VendorMaterial {
+  id       String @id @default(cuid())
+  vendorId String
+  vendor   Vendor @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+
+  materialId String
+  material   RawMaterial @relation(fields: [materialId], references: [id], onDelete: Cascade)
+
+  vendorSku   String?
+  isPreferred Boolean @default(false)
+
+  @@unique([vendorId, materialId])
+  @@index([materialId])
+}
+
+enum PoStatus {
+  DRAFT
+  PENDING_APPROVAL
+  APPROVED
+  PARTIALLY_RECEIVED
+  RECEIVED
+  CANCELLED
+  CLOSED
+}
+
+model PurchaseOrder {
+  id     String   @id @default(cuid())
+  code   String   @unique // PO-2026-0001
+  status PoStatus @default(DRAFT)
+
+  vendorId String
+  vendor   Vendor @relation(fields: [vendorId], references: [id], onDelete: Restrict)
+
+  /// Where this order came from. Both are optional because an order can still be
+  /// raised directly — but when they are set the whole chain is walkable from
+  /// either end, which is the point of the sourcing documents existing at all.
+  requisitionId String?
+  requisition   PurchaseRequisition? @relation(fields: [requisitionId], references: [id], onDelete: SetNull)
+
+  quotationId String?
+  quotation   PurchaseQuotation? @relation(fields: [quotationId], references: [id], onDelete: SetNull)
+
+  orderedOn     DateTime  @default(now())
+  expectedOn    DateTime?
+  deliveryTerms String?
+  paymentTerms  String?
+
+  /// Set when the order is raised, from totalValue against the role limits in
+  /// src/lib/rbac.ts. Null on drafts that have never been submitted.
+  approvalTier ApprovalTier?
+
+  subtotal   Decimal @default(0) @db.Decimal(14, 2)
+  taxAmount  Decimal @default(0) @db.Decimal(14, 2)
+  freight    Decimal @default(0) @db.Decimal(14, 2)
+  totalValue Decimal @default(0) @db.Decimal(14, 2)
+  currency   String  @default("INR")
+
+  raisedById String?
+  raisedBy   User?   @relation("PORaisedBy", fields: [raisedById], references: [id], onDelete: SetNull)
+
+  approvedById String?
+  approvedBy   User?     @relation("POApprovedBy", fields: [approvedById], references: [id], onDelete: SetNull)
+  approvedAt   DateTime?
+
+  remark String?
+
+  lines         PurchaseOrderLine[]
+  goodsReceipts GoodsReceipt[]
+  vendorBills   VendorBill[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([vendorId])
+  @@index([orderedOn])
+}
+
+model PurchaseOrderLine {
+  id              String        @id @default(cuid())
+  purchaseOrderId String
+  purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+
+  materialId String
+  material   RawMaterial @relation(fields: [materialId], references: [id], onDelete: Restrict)
+
+  lineNo     Int
+  quantityKg Decimal @db.Decimal(12, 3)
+  ratePerKg  Decimal @db.Decimal(10, 2)
+  taxPct     Decimal @default(18) @db.Decimal(5, 2)
+  lineTotal  Decimal @db.Decimal(14, 2)
+
+  /// Running total across all GRNs against this line. Drives PO status.
+  receivedKg Decimal @default(0) @db.Decimal(12, 3)
+
+  grnLines GoodsReceiptLine[]
+
+  @@index([purchaseOrderId])
+  @@index([materialId])
+}
+
+enum GrnStatus {
+  DRAFT
+  PENDING_QC
+  QC_PASSED
+  QC_FAILED
+  PARTIALLY_ACCEPTED
+  POSTED
+}
+
+enum QcResult {
+  PENDING
+  PASS
+  FAIL
+  CONDITIONAL
+}
+
+/// Goods Receipt Note. Reconciles against its PO and moves stock in traceable batches.
+model GoodsReceipt {
+  id     String    @id @default(cuid())
+  code   String    @unique // GRN-2026-0001
+  status GrnStatus @default(DRAFT)
+
+  purchaseOrderId String
+  purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Restrict)
+
+  vendorId String
+  vendor   Vendor @relation(fields: [vendorId], references: [id], onDelete: Restrict)
+
+  receivedOn  DateTime  @default(now())
+  invoiceNo   String?
+  invoiceDate DateTime?
+  vehicleNo   String?
+  eWayBillNo  String?
+  gateEntryNo String?
+
+  receivedById String?
+  receivedBy   User?   @relation("GrnReceivedBy", fields: [receivedById], references: [id], onDelete: SetNull)
+
+  inspectedById String?
+  inspectedBy   User?     @relation("GrnInspectedBy", fields: [inspectedById], references: [id], onDelete: SetNull)
+  inspectedAt   DateTime?
+  qcRemark      String?
+
+  postedAt DateTime?
+  remark   String?
+
+  lines          GoodsReceiptLine[]
+  rejectionNotes VendorRejectionNote[]
+  vendorBills    VendorBill[]
+  debitNotes     DebitNote[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([purchaseOrderId])
+  @@index([vendorId])
+  @@index([receivedOn])
+}
+
+model GoodsReceiptLine {
+  id             String       @id @default(cuid())
+  goodsReceiptId String
+  goodsReceipt   GoodsReceipt @relation(fields: [goodsReceiptId], references: [id], onDelete: Cascade)
+
+  purchaseOrderLineId String
+  purchaseOrderLine   PurchaseOrderLine @relation(fields: [purchaseOrderLineId], references: [id], onDelete: Restrict)
+
+  lineNo        Int
+  /// What the challan claimed.
+  challanQtyKg  Decimal @db.Decimal(12, 3)
+  /// What the weighbridge said.
+  receivedQtyKg Decimal @db.Decimal(12, 3)
+  acceptedQtyKg Decimal @db.Decimal(12, 3)
+  rejectedQtyKg Decimal @default(0) @db.Decimal(12, 3)
+
+  qcResult QcResult @default(PENDING)
+  qcRemark String?
+
+  /// The batch this receipt created. Null until QC passes and the GRN posts.
+  batchId String?         @unique
+  batch   InventoryBatch? @relation("GrnAcceptedBatch", fields: [batchId], references: [id], onDelete: SetNull)
+
+  /// The batch created in the Rejection warehouse when rejectedQtyKg > 0.
+  rejectedBatchId String?         @unique
+  rejectedBatch   InventoryBatch? @relation("GrnRejectedBatch", fields: [rejectedBatchId], references: [id], onDelete: SetNull)
+
+  rejectionLines VendorRejectionNoteLine[]
+  debitNoteLines DebitNoteLine[]
+
+  @@index([goodsReceiptId])
+  @@index([purchaseOrderLineId])
+}
+
+enum BatchStatus {
+  QUARANTINE
+  AVAILABLE
+  CONSUMED
+  REJECTED
+  EXPIRED
+}
+
+/// One lot of one material, traceable back to the GRN line that created it.
+model InventoryBatch {
+  id      String  @id @default(cuid())
+  batchNo String  @unique // B-2026-00001
+  lotRef  String? // vendor's own lot marking
+
+  materialId String
+  material   RawMaterial @relation(fields: [materialId], references: [id], onDelete: Restrict)
+
+  status BatchStatus @default(QUARANTINE)
+
+  receivedQtyKg  Decimal @db.Decimal(12, 3)
+  availableQtyKg Decimal @db.Decimal(12, 3)
+  ratePerKg      Decimal @db.Decimal(10, 2)
+
+  warehouseId String
+  warehouse   Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+  binLocation String?
+
+  manufacturedOn DateTime?
+  expiresOn      DateTime?
+  receivedOn     DateTime  @default(now())
+
+  grnLine         GoodsReceiptLine?     @relation("GrnAcceptedBatch")
+  rejectedGrnLine GoodsReceiptLine?     @relation("GrnRejectedBatch")
+  movements       StockMovement[]
+  allocations     StockAllocation[]
+  challanLines    DeliveryChallanLine[]
+
+  // Planning (PLN) relations
+  planningAllocations PlanningAllocation[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([materialId, status])
+  @@index([status])
+  @@index([receivedOn])
+  @@index([warehouseId])
+}
+
+enum MovementKind {
+  GRN_RECEIPT
+  GRN_REJECT
+  ISSUE_TO_PRODUCTION
+  ISSUE_TO_LAB
+  RETURN_TO_STORE
+  RETURN_TO_VENDOR
+  ADJUSTMENT_POSITIVE
+  ADJUSTMENT_NEGATIVE
+  TRANSFER
+  SCRAP
+}
+
+/// Append-only ledger. Every gram in or out of the store is a row here — this is
+/// also the table the virtualized grid is proven against (tens of thousands of rows).
+model StockMovement {
+  id   String       @id @default(cuid())
+  kind MovementKind
+
+  materialId String
+  material   RawMaterial @relation(fields: [materialId], references: [id], onDelete: Restrict)
+
+  batchId String?
+  batch   InventoryBatch? @relation(fields: [batchId], references: [id], onDelete: SetNull)
+
+  /// Signed: positive is into store, negative is out.
+  quantityKg     Decimal  @db.Decimal(12, 3)
+  balanceAfterKg Decimal? @db.Decimal(14, 3)
+  ratePerKg      Decimal? @db.Decimal(10, 2)
+
+  reference String? // GRN code, work order, lab requisition
+  remark    String?
+
+  userId String?
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  occurredAt DateTime @default(now())
+
+  @@index([materialId, occurredAt])
+  @@index([batchId])
+  @@index([kind])
+  @@index([occurredAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WAREHOUSES
+//
+// The Store flow turns on *which* warehouse a quantity lands in: accepted stock
+// goes to Store, a QC reject goes to Rejection and waits for a vendor rejection
+// note, scrap leaves through its own door. Held as a free-text label, every one
+// of those was an untyped convention that no query could rely on.
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum WarehouseKind {
+  QUARANTINE // received, not yet inspected
+  STORE // accepted and issuable
+  REJECTION // QC-failed, awaiting return to the vendor
+  SCRAP // written off
+  WIP // issued to production
+}
+
+model Warehouse {
+  id       String        @id @default(cuid())
+  code     String        @unique // WH-STORE
+  name     String
+  kind     WarehouseKind
+  location String?
+  isActive Boolean       @default(true)
+
+  batches                       InventoryBatch[]
+  directManufacturingWorkOrders DirectManufacturingWorkOrder[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([kind])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PURCHASE REQUISITION — the demand that starts the chain
+//
+// Everything downstream (inquiry → quotation → order) can trace back to the
+// requisition line that asked for it, and a line carries its own ordered total
+// so a partly-sourced requisition is visible without walking the orders.
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum RequisitionStatus {
+  DRAFT
+  PENDING_APPROVAL
+  APPROVED
+  REJECTED
+  PARTIALLY_ORDERED
+  ORDERED
+  CLOSED
+  CANCELLED
+}
+
+model PurchaseRequisition {
+  id     String            @id @default(cuid())
+  code   String            @unique // PR-2026-0001
+  status RequisitionStatus @default(DRAFT)
+
+  /// Why the material is needed — a project trial, a reorder, a shortage.
+  purpose    String?
+  requiredBy DateTime?
+
+  projectId String?
+  project   Project? @relation(fields: [projectId], references: [id], onDelete: SetNull)
+
+  raisedById String?
+  raisedBy   User?   @relation("PrRaisedBy", fields: [raisedById], references: [id], onDelete: SetNull)
+
+  approvedById String?
+  approvedBy   User?     @relation("PrApprovedBy", fields: [approvedById], references: [id], onDelete: SetNull)
+  approvedAt   DateTime?
+  /// Set when status is REJECTED. Written so the raiser can act on it.
+  decisionNote String?
+
+  remark String?
+
+  lines     PurchaseRequisitionLine[]
+  inquiries PurchaseInquiry[]
+  orders    PurchaseOrder[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([requiredBy])
+}
+
+model PurchaseRequisitionLine {
+  id            String              @id @default(cuid())
+  requisitionId String
+  requisition   PurchaseRequisition @relation(fields: [requisitionId], references: [id], onDelete: Cascade)
+
+  materialId String
+  material   RawMaterial @relation(fields: [materialId], references: [id], onDelete: Restrict)
+
+  lineNo     Int
+  quantityKg Decimal @db.Decimal(12, 3)
+  /// Running total already committed on purchase orders. Drives the status.
+  orderedKg  Decimal @default(0) @db.Decimal(12, 3)
+
+  /// Stock on hand when the line was raised — the justification, frozen.
+  stockAtRaiseKg Decimal? @db.Decimal(12, 3)
+
+  remark String?
+
+  inquiryLines PurchaseInquiryLine[]
+
+  @@index([requisitionId])
+  @@index([materialId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PURCHASE INQUIRY (RFQ) — one inquiry, many vendors, many quotations back
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum InquiryStatus {
+  DRAFT
+  SENT
+  QUOTES_IN
+  COMPARED
+  CLOSED
+  CANCELLED
+}
+
+model PurchaseInquiry {
+  id     String        @id @default(cuid())
+  code   String        @unique // PI-2026-0001
+  status InquiryStatus @default(DRAFT)
+
+  requisitionId String?
+  requisition   PurchaseRequisition? @relation(fields: [requisitionId], references: [id], onDelete: SetNull)
+
+  issuedOn DateTime  @default(now())
+  /// Quotations received after this are flagged late, never silently accepted.
+  dueOn    DateTime?
+
+  raisedById String?
+  raisedBy   User?   @relation("PiRaisedBy", fields: [raisedById], references: [id], onDelete: SetNull)
+
+  terms  String?
+  remark String?
+
+  lines      PurchaseInquiryLine[]
+  vendors    PurchaseInquiryVendor[]
+  quotations PurchaseQuotation[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([issuedOn])
+}
+
+model PurchaseInquiryLine {
+  id        String          @id @default(cuid())
+  inquiryId String
+  inquiry   PurchaseInquiry @relation(fields: [inquiryId], references: [id], onDelete: Cascade)
+
+  materialId String
+  material   RawMaterial @relation(fields: [materialId], references: [id], onDelete: Restrict)
+
+  requisitionLineId String?
+  requisitionLine   PurchaseRequisitionLine? @relation(fields: [requisitionLineId], references: [id], onDelete: SetNull)
+
+  lineNo     Int
+  quantityKg Decimal @db.Decimal(12, 3)
+  remark     String?
+
+  quotationLines PurchaseQuotationLine[]
+
+  @@index([inquiryId])
+  @@index([materialId])
+}
+
+/// Who the inquiry went to. Kept separate from the quotation so a vendor that
+/// never replied is still visible — silence is information when rating a vendor.
+model PurchaseInquiryVendor {
+  id        String          @id @default(cuid())
+  inquiryId String
+  inquiry   PurchaseInquiry @relation(fields: [inquiryId], references: [id], onDelete: Cascade)
+
+  vendorId String
+  vendor   Vendor @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+
+  sentAt      DateTime?
+  respondedAt DateTime?
+
+  @@unique([inquiryId, vendorId])
+  @@index([vendorId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PURCHASE QUOTATION — the vendor answer, and the comparison that picks one
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum QuotationStatus {
+  DRAFT
+  SUBMITTED
+  UNDER_REVIEW
+  SELECTED
+  REJECTED
+  EXPIRED
+}
+
+model PurchaseQuotation {
+  id     String          @id @default(cuid())
+  code   String          @unique // PQ-2026-0001
+  status QuotationStatus @default(SUBMITTED)
+
+  inquiryId String
+  inquiry   PurchaseInquiry @relation(fields: [inquiryId], references: [id], onDelete: Cascade)
+
+  vendorId String
+  vendor   Vendor @relation(fields: [vendorId], references: [id], onDelete: Restrict)
+
+  /// The vendor own reference on the paper they sent.
+  vendorRef  String?
+  receivedOn DateTime  @default(now())
+  validUntil DateTime?
+
+  paymentTerms  String?
+  deliveryTerms String?
+  leadTimeDays  Int?
+
+  subtotal   Decimal @default(0) @db.Decimal(14, 2)
+  taxAmount  Decimal @default(0) @db.Decimal(14, 2)
+  freight    Decimal @default(0) @db.Decimal(14, 2)
+  totalValue Decimal @default(0) @db.Decimal(14, 2)
+
+  /// Set on the winner only. The losers carry decisionNote instead, so the
+  /// comparison records why it went the way it did rather than only that it did.
+  selectedById String?
+  selectedBy   User?     @relation("PqSelectedBy", fields: [selectedById], references: [id], onDelete: SetNull)
+  selectedAt   DateTime?
+  decisionNote String?
+
+  remark String?
+
+  lines  PurchaseQuotationLine[]
+  orders PurchaseOrder[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([inquiryId, vendorId])
+  @@index([status])
+  @@index([vendorId])
+}
+
+model PurchaseQuotationLine {
+  id          String            @id @default(cuid())
+  quotationId String
+  quotation   PurchaseQuotation @relation(fields: [quotationId], references: [id], onDelete: Cascade)
+
+  materialId String
+  material   RawMaterial @relation(fields: [materialId], references: [id], onDelete: Restrict)
+
+  inquiryLineId String?
+  inquiryLine   PurchaseInquiryLine? @relation(fields: [inquiryLineId], references: [id], onDelete: SetNull)
+
+  lineNo     Int
+  quantityKg Decimal @db.Decimal(12, 3)
+  ratePerKg  Decimal @db.Decimal(10, 2)
+  taxPct     Decimal @default(18) @db.Decimal(5, 2)
+  lineTotal  Decimal @db.Decimal(14, 2)
+
+  leadDays Int?
+  remark   String?
+
+  @@index([quotationId])
+  @@index([materialId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VENDOR REJECTION NOTE — the way rejected material leaves the building
+//
+// QC rejecting a quantity is not the end of it: the stock sits in the Rejection
+// warehouse and is still the vendor problem. The note is the approved document
+// that authorises the return, and the challan is what travels with the lorry.
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum VrnStatus {
+  DRAFT
+  PENDING_APPROVAL
+  APPROVED
+  DISPATCHED
+  CLOSED
+  CANCELLED
+}
+
+model VendorRejectionNote {
+  id     String    @id @default(cuid())
+  code   String    @unique // VRN-2026-0001
+  status VrnStatus @default(DRAFT)
+
+  goodsReceiptId String
+  goodsReceipt   GoodsReceipt @relation(fields: [goodsReceiptId], references: [id], onDelete: Restrict)
+
+  vendorId String
+  vendor   Vendor @relation(fields: [vendorId], references: [id], onDelete: Restrict)
+
+  raisedById String?
+  raisedBy   User?   @relation("VrnRaisedBy", fields: [raisedById], references: [id], onDelete: SetNull)
+
+  approvedById String?
+  approvedBy   User?     @relation("VrnApprovedBy", fields: [approvedById], references: [id], onDelete: SetNull)
+  approvedAt   DateTime?
+
+  /// The outward challan. Written when the material physically leaves.
+  challanNo    String?
+  dispatchedAt DateTime?
+  vehicleNo    String?
+
+  /// Credit note or replacement expected back from the vendor.
+  expectedResolution String?
+
+  remark String?
+
+  lines VendorRejectionNoteLine[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([vendorId])
+}
+
+model VendorRejectionNoteLine {
+  id     String              @id @default(cuid())
+  noteId String
+  note   VendorRejectionNote @relation(fields: [noteId], references: [id], onDelete: Cascade)
+
+  grnLineId String?
+  grnLine   GoodsReceiptLine? @relation(fields: [grnLineId], references: [id], onDelete: SetNull)
+
+  materialId String
+  material   RawMaterial @relation(fields: [materialId], references: [id], onDelete: Restrict)
+
+  lineNo     Int
+  quantityKg Decimal @db.Decimal(12, 3)
+  ratePerKg  Decimal @db.Decimal(10, 2)
+  /// What failed. Carried from the QC remark, editable before approval.
+  reason     String?
+
+  @@index([noteId])
+  @@index([materialId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SALES
+//
+// The demand end of the chain. It hangs off the compound the customer actually
+// wants — Customer → Project → Formulation — so a quotation is priced from the
+// live approved rate base rather than from a number somebody remembered. That
+// join is the point: an approved price revision this morning moves the margin on
+// every open quotation this afternoon.
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum SalesInquiryStatus {
+  DRAFT
+  OPEN
+  QUOTED
+  WON
+  LOST
+  CLOSED
+}
+
+model SalesInquiry {
+  id     String             @id @default(cuid())
+  code   String             @unique // SI-2026-0001
+  status SalesInquiryStatus @default(OPEN)
+
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
+
+  /// The compound being asked about, when it is an existing one. A genuinely new
+  /// requirement arrives with no project and gets one raised for it.
+  projectId String?
+  project   Project? @relation(fields: [projectId], references: [id], onDelete: SetNull)
+
+  receivedOn DateTime  @default(now())
+  requiredBy DateTime?
+
+  /// How it came in — the trail Sales already keeps on the customer record.
+  source String?
+
+  ownerId String?
+  owner   User?   @relation("SiOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+
+  /// Why it was lost. Written when status becomes LOST, so the pipeline explains
+  /// itself at review time instead of just shrinking.
+  lostReason String?
+
+  remark String?
+
+  lines      SalesInquiryLine[]
+  quotations SalesQuotation[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([customerId])
+  @@index([receivedOn])
+}
+
+model SalesInquiryLine {
+  id        String       @id @default(cuid())
+  inquiryId String
+  inquiry   SalesInquiry @relation(fields: [inquiryId], references: [id], onDelete: Cascade)
+
+  lineNo      Int
+  /// Free text: at inquiry stage the customer describes what they want, they do
+  /// not quote our project code.
+  description String
+  quantityKg  Decimal  @db.Decimal(12, 3)
+  targetRate  Decimal? @db.Decimal(10, 2)
+
+  @@index([inquiryId])
+}
+
+// ── COST SHEET ──────────────────────────────────────────────────────────────
+//
+// The costing behind a quoted rate, frozen at the moment it was worked out. It
+// has to be frozen: the rate base moves, and a quotation defended six weeks later
+// needs the numbers it was actually built on, not today's.
+
+enum CostSheetStatus {
+  DRAFT
+  PENDING_APPROVAL
+  APPROVED
+  REJECTED
+  SUPERSEDED
+}
+
+model CostSheet {
+  id     String          @id @default(cuid())
+  code   String          @unique // CS-2026-0001
+  status CostSheetStatus @default(DRAFT)
+
+  formulationId String
+  formulation   Formulation @relation(fields: [formulationId], references: [id], onDelete: Restrict)
+
+  /// Snapshot of the material cost per kg at the moment the sheet was built,
+  /// from the then-current approved rates.
+  materialCostPerKg Decimal @db.Decimal(10, 4)
+  /// Everything that is not raw material: power, labour, packing, wastage.
+  conversionPerKg   Decimal @default(0) @db.Decimal(10, 4)
+  overheadPct       Decimal @default(0) @db.Decimal(5, 2)
+  marginPct         Decimal @default(0) @db.Decimal(5, 2)
+  /// The number the sheet exists to produce.
+  sellingRatePerKg  Decimal @db.Decimal(10, 2)
+
+  preparedById String?
+  preparedBy   User?   @relation("CsPreparedBy", fields: [preparedById], references: [id], onDelete: SetNull)
+
+  approvedById String?
+  approvedBy   User?     @relation("CsApprovedBy", fields: [approvedById], references: [id], onDelete: SetNull)
+  approvedAt   DateTime?
+  decisionNote String?
+
+  remark String?
+
+  lines      CostSheetLine[]
+  quotations SalesQuotation[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([formulationId])
+}
+
+/// One row per material in the formulation, with the rate used. Kept so the sheet
+/// can be read back line by line rather than as a single opaque total.
+model CostSheetLine {
+  id          String    @id @default(cuid())
+  costSheetId String
+  costSheet   CostSheet @relation(fields: [costSheetId], references: [id], onDelete: Cascade)
+
+  materialId String
+  material   RawMaterial @relation(fields: [materialId], references: [id], onDelete: Restrict)
+
+  lineNo     Int
+  phr        Decimal @db.Decimal(8, 3)
+  /// Share of one kg of finished compound this material accounts for.
+  fractionKg Decimal @db.Decimal(10, 6)
+  ratePerKg  Decimal @db.Decimal(10, 2)
+  costPerKg  Decimal @db.Decimal(10, 4)
+
+  @@index([costSheetId])
+  @@index([materialId])
+}
+
+// ── SALES QUOTATION ─────────────────────────────────────────────────────────
+
+enum SalesQuotationStatus {
+  DRAFT
+  SENT
+  UNDER_NEGOTIATION
+  ACCEPTED
+  REJECTED
+  EXPIRED
+}
+
+model SalesQuotation {
+  id     String               @id @default(cuid())
+  code   String               @unique // SQ-2026-0001
+  status SalesQuotationStatus @default(DRAFT)
+
+  inquiryId String?
+  inquiry   SalesInquiry? @relation(fields: [inquiryId], references: [id], onDelete: SetNull)
+
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
+
+  costSheetId String?
+  costSheet   CostSheet? @relation(fields: [costSheetId], references: [id], onDelete: SetNull)
+
+  issuedOn   DateTime  @default(now())
+  validUntil DateTime?
+
+  paymentTerms  String?
+  deliveryTerms String?
+  leadTimeDays  Int?
+
+  subtotal   Decimal @default(0) @db.Decimal(14, 2)
+  taxAmount  Decimal @default(0) @db.Decimal(14, 2)
+  totalValue Decimal @default(0) @db.Decimal(14, 2)
+
+  ownerId String?
+  owner   User?   @relation("SqOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+
+  decisionNote String?
+  remark       String?
+
+  lines  SalesQuotationLine[]
+  orders SalesOrder[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([customerId])
+}
+
+model SalesQuotationLine {
+  id          String         @id @default(cuid())
+  quotationId String
+  quotation   SalesQuotation @relation(fields: [quotationId], references: [id], onDelete: Cascade)
+
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Restrict)
+
+  lineNo     Int
+  quantityKg Decimal @db.Decimal(12, 3)
+  ratePerKg  Decimal @db.Decimal(10, 2)
+  taxPct     Decimal @default(18) @db.Decimal(5, 2)
+  lineTotal  Decimal @db.Decimal(14, 2)
+
+  /// Carried from the cost sheet so a discounted line shows what it did to margin
+  /// at the moment of discounting, not only what it did to the total.
+  costPerKg Decimal? @db.Decimal(10, 4)
+
+  @@index([quotationId])
+  @@index([projectId])
+}
+
+// ── SALES ORDER ─────────────────────────────────────────────────────────────
+
+enum SalesOrderStatus {
+  DRAFT
+  PENDING_APPROVAL
+  CONFIRMED
+  PARTIALLY_DISPATCHED
+  DISPATCHED
+  INVOICED
+  CLOSED
+  CANCELLED
+}
+
+model SalesOrder {
+  id     String           @id @default(cuid())
+  code   String           @unique // SO-2026-0001
+  status SalesOrderStatus @default(DRAFT)
+
+  quotationId String?
+  quotation   SalesQuotation? @relation(fields: [quotationId], references: [id], onDelete: SetNull)
+
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
+
+  /// The customer's own PO number. Operators search by it more than by ours.
+  customerPoNo   String?
+  customerPoDate DateTime?
+
+  orderedOn  DateTime  @default(now())
+  promisedOn DateTime?
+
+  paymentTerms  String?
+  deliveryTerms String?
+
+  subtotal   Decimal @default(0) @db.Decimal(14, 2)
+  taxAmount  Decimal @default(0) @db.Decimal(14, 2)
+  freight    Decimal @default(0) @db.Decimal(14, 2)
+  totalValue Decimal @default(0) @db.Decimal(14, 2)
+
+  raisedById String?
+  raisedBy   User?   @relation("SoRaisedBy", fields: [raisedById], references: [id], onDelete: SetNull)
+
+  /// Confirmation is the credit gate. An order past the customer's limit stops
+  /// here rather than being discovered at despatch.
+  approvedById String?
+  approvedBy   User?     @relation("SoApprovedBy", fields: [approvedById], references: [id], onDelete: SetNull)
+  approvedAt   DateTime?
+
+  remark String?
+
+  sourceReturn SalesReturn? @relation("ReturnResendOrder")
+
+  originalOrderId   String?
+  originalOrder     SalesOrder?  @relation("ReplacementOrders", fields: [originalOrderId], references: [id], onDelete: SetNull)
+  replacementOrders SalesOrder[] @relation("ReplacementOrders")
+
+  lines    SalesOrderLine[]
+  challans DeliveryChallan[]
+  invoices SalesInvoice[]
+  returns  SalesReturn[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([customerId])
+  @@index([orderedOn])
+}
+
+model SalesOrderLine {
+  id           String     @id @default(cuid())
+  salesOrderId String
+  salesOrder   SalesOrder @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
+
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Restrict)
+
+  lineNo     Int
+  quantityKg Decimal @db.Decimal(12, 3)
+  ratePerKg  Decimal @db.Decimal(10, 2)
+  taxPct     Decimal @default(18) @db.Decimal(5, 2)
+  lineTotal  Decimal @db.Decimal(14, 2)
+
+  /// Reserved against batches but not yet gone out.
+  allocatedKg  Decimal @default(0) @db.Decimal(12, 3)
+  /// Actually despatched on a challan.
+  dispatchedKg Decimal @default(0) @db.Decimal(12, 3)
+  /// Reopened capacity for resend.
+  reopenedKg   Decimal @default(0) @db.Decimal(12, 3)
+
+  allocations  StockAllocation[]
+  challanLines DeliveryChallanLine[]
+  returnLines  SalesReturnLine[]
+
+  @@index([salesOrderId])
+  @@index([projectId])
+}
+
+/// Stock reserved for an order line, batch by batch.
+///
+/// Allocation is deliberately separate from despatch: reserving says the material
+/// is spoken for and must stop appearing as freely available, which is a different
+/// event from it leaving the gate.
+model StockAllocation {
+  id String @id @default(cuid())
+
+  salesOrderLineId String
+  salesOrderLine   SalesOrderLine @relation(fields: [salesOrderLineId], references: [id], onDelete: Cascade)
+
+  batchId String
+  batch   InventoryBatch @relation(fields: [batchId], references: [id], onDelete: Restrict)
+
+  quantityKg Decimal @db.Decimal(12, 3)
+  /// Cleared when the allocation is consumed by a despatch or released.
+  isActive   Boolean @default(true)
+
+  allocatedById String?
+  allocatedBy   User?   @relation("AllocatedBy", fields: [allocatedById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+
+  @@index([salesOrderLineId])
+  @@index([batchId])
+  @@index([isActive])
+}
+
+// ── DESPATCH ────────────────────────────────────────────────────────────────
+
+enum ChallanStatus {
+  DRAFT
+  PACKED
+  DISPATCHED
+  DELIVERED
+  CANCELLED
+}
+
+model DeliveryChallan {
+  id     String        @id @default(cuid())
+  code   String        @unique // DC-2026-0001
+  status ChallanStatus @default(DRAFT)
+
+  salesOrderId String
+  salesOrder   SalesOrder @relation(fields: [salesOrderId], references: [id], onDelete: Restrict)
+
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
+
+  /// Packing list fields — the same document in practice, so they live together
+  /// rather than as a second record that can disagree with this one.
+  packedOn   DateTime?
+  packageCnt Int?
+  grossKg    Decimal?  @db.Decimal(12, 3)
+
+  dispatchedOn DateTime?
+  vehicleNo    String?
+  driverName   String?
+  eWayBillNo   String?
+  lrNo         String?
+  deliveredOn  DateTime?
+
+  raisedById String?
+  raisedBy   User?   @relation("DcRaisedBy", fields: [raisedById], references: [id], onDelete: SetNull)
+
+  remark String?
+
+  lines       DeliveryChallanLine[]
+  invoices    SalesInvoice[]
+  packingList PackingList?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([salesOrderId])
+  @@index([customerId])
+}
+
+model DeliveryChallanLine {
+  id        String          @id @default(cuid())
+  challanId String
+  challan   DeliveryChallan @relation(fields: [challanId], references: [id], onDelete: Cascade)
+
+  salesOrderLineId String
+  salesOrderLine   SalesOrderLine @relation(fields: [salesOrderLineId], references: [id], onDelete: Restrict)
+
+  batchId String?
+  batch   InventoryBatch? @relation(fields: [batchId], references: [id], onDelete: SetNull)
+
+  lineNo     Int
+  quantityKg Decimal @db.Decimal(12, 3)
+  ratePerKg  Decimal @db.Decimal(10, 2)
+
+  packingPackageLines PackingPackageLine[]
+
+  @@index([challanId])
+  @@index([salesOrderLineId])
+}
+
+// ── PACKING LIST ────────────────────────────────────────────────────────────
+
+enum PackingListStatus {
+  DRAFT
+  FINAL
+}
+
+model PackingList {
+  id     String            @id @default(cuid())
+  code   String            @unique // PKL-YYYY-NNNN
+  status PackingListStatus @default(DRAFT)
+
+  challanId String          @unique
+  challan   DeliveryChallan @relation(fields: [challanId], references: [id], onDelete: Cascade)
+
+  remark String?
+
+  createdById   String
+  finalizedById String?
+  finalizedAt   DateTime?
+
+  packages PackingPackage[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+}
+
+model PackingPackage {
+  id            String      @id @default(cuid())
+  packingListId String
+  packingList   PackingList @relation(fields: [packingListId], references: [id], onDelete: Cascade)
+
+  packageNo   Int
+  packageType String? // carton/bag/pallet
+  grossKg     Decimal @db.Decimal(12, 3)
+  tareKg      Decimal @default(0) @db.Decimal(12, 3)
+
+  lines PackingPackageLine[]
+
+  @@unique([packingListId, packageNo])
+  @@index([packingListId])
+}
+
+model PackingPackageLine {
+  id        String         @id @default(cuid())
+  packageId String
+  package   PackingPackage @relation(fields: [packageId], references: [id], onDelete: Cascade)
+
+  challanLineId String
+  challanLine   DeliveryChallanLine @relation(fields: [challanLineId], references: [id], onDelete: Restrict)
+
+  quantityKg Decimal @db.Decimal(12, 3)
+
+  @@index([packageId])
+  @@index([challanLineId])
+}
+
+// ── INVOICE ─────────────────────────────────────────────────────────────────
+
+enum SalesInvoiceStatus {
+  DRAFT
+  RAISED
+  PART_PAID
+  PAID
+  OVERDUE
+  CANCELLED
+}
+
+model SalesInvoice {
+  id     String             @id @default(cuid())
+  code   String             @unique // INV-2026-0001
+  status SalesInvoiceStatus @default(DRAFT)
+
+  salesOrderId String
+  salesOrder   SalesOrder @relation(fields: [salesOrderId], references: [id], onDelete: Restrict)
+
+  challanId String?
+  challan   DeliveryChallan? @relation(fields: [challanId], references: [id], onDelete: SetNull)
+
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
+
+  invoiceDate DateTime  @default(now())
+  dueOn       DateTime?
+
+  subtotal       Decimal @default(0) @db.Decimal(14, 2)
+  taxAmount      Decimal @default(0) @db.Decimal(14, 2)
+  totalValue     Decimal @default(0) @db.Decimal(14, 2)
+  paidAmount     Decimal @default(0) @db.Decimal(14, 2)
+  creditedAmount Decimal @default(0) @db.Decimal(14, 2)
+
+  raisedById String?
+  raisedBy   User?   @relation("InvRaisedBy", fields: [raisedById], references: [id], onDelete: SetNull)
+
+  remark String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  creditNotes CreditNote[]
+
+  @@index([status])
+  @@index([customerId])
+  @@index([invoiceDate])
+}
+
+// ── SALES RETURN ────────────────────────────────────────────────────────────
+//
+// Material coming back from a customer. It is inspected exactly like an inward
+// receipt, because until QC has looked at it we do not know whether it is stock
+// again or scrap — putting it straight back on the shelf is how a rejected lot
+// gets sold twice.
+
+enum SalesReturnStatus {
+  DRAFT
+  PENDING_QC
+  RESTOCKED
+  SCRAPPED
+  PARTIALLY_RESTOCKED
+  CLOSED
+  CANCELLED
+}
+
+enum ReturnResolution {
+  REOPENED_ORDER
+  NEW_ORDER
+  NONE
+}
+
+model SalesReturn {
+  id     String            @id @default(cuid())
+  code   String            @unique // SRN-2026-0001
+  status SalesReturnStatus @default(DRAFT)
+
+  salesOrderId String
+  salesOrder   SalesOrder @relation(fields: [salesOrderId], references: [id], onDelete: Restrict)
+
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
+
+  returnedOn   DateTime @default(now())
+  reason       String?
+  customerDcNo String?
+
+  receivedById String?
+  receivedBy   User?   @relation("SrnReceivedBy", fields: [receivedById], references: [id], onDelete: SetNull)
+
+  inspectedById String?
+  inspectedBy   User?     @relation("SrnInspectedBy", fields: [inspectedById], references: [id], onDelete: SetNull)
+  inspectedAt   DateTime?
+  qcRemark      String?
+
+  resolution     ReturnResolution?
+  resolutionNote String?
+
+  resendOrderId String?     @unique
+  resendOrder   SalesOrder? @relation("ReturnResendOrder", fields: [resendOrderId], references: [id], onDelete: SetNull)
+
+  remark String?
+
+  lines SalesReturnLine[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  creditNotes CreditNote[]
+
+  @@index([status])
+  @@index([customerId])
+}
+
+model SalesReturnLine {
+  id       String      @id @default(cuid())
+  returnId String
+  return   SalesReturn @relation(fields: [returnId], references: [id], onDelete: Cascade)
+
+  salesOrderLineId String?
+  salesOrderLine   SalesOrderLine? @relation(fields: [salesOrderLineId], references: [id], onDelete: SetNull)
+
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Restrict)
+
+  lineNo      Int
+  quantityKg  Decimal @db.Decimal(12, 3)
+  /// Split by the inspection. Restocked goes back as a batch; scrapped does not.
+  restockedKg Decimal @default(0) @db.Decimal(12, 3)
+  scrappedKg  Decimal @default(0) @db.Decimal(12, 3)
+  resendKg    Decimal @default(0) @db.Decimal(12, 3)
+
+  qcResult QcResult @default(PENDING)
+  qcRemark String?
+
+  creditNoteLines CreditNoteLine[]
+
+  @@index([returnId])
+  @@index([projectId])
+}
+
+// ── CREDIT NOTE ─────────────────────────────────────────────────────────────
+
+enum CreditNoteStatus {
+  ISSUED
+  CANCELLED
+}
+
+model CreditNote {
+  id             String           @id @default(cuid())
+  number         String           @unique // CN-2026-0001
+  date           DateTime         @default(now())
+  salesInvoiceId String
+  salesInvoice   SalesInvoice     @relation(fields: [salesInvoiceId], references: [id], onDelete: Restrict)
+  salesReturnId  String
+  salesReturn    SalesReturn      @relation(fields: [salesReturnId], references: [id], onDelete: Restrict)
+  customerId     String
+  customer       Customer         @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  reason         String?
+  taxableValue   Decimal          @default(0) @db.Decimal(14, 2)
+  taxAmount      Decimal          @default(0) @db.Decimal(14, 2)
+  totalValue     Decimal          @default(0) @db.Decimal(14, 2)
+  status         CreditNoteStatus @default(ISSUED)
+  createdById    String?
+  createdBy      User?            @relation("CnCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+
+  lines CreditNoteLine[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([salesReturnId, salesInvoiceId])
+  @@index([customerId])
+  @@index([salesInvoiceId])
+}
+
+model CreditNoteLine {
+  id                String           @id @default(cuid())
+  creditNoteId      String
+  creditNote        CreditNote       @relation(fields: [creditNoteId], references: [id], onDelete: Cascade)
+  salesReturnLineId String?
+  salesReturnLine   SalesReturnLine? @relation(fields: [salesReturnLineId], references: [id], onDelete: SetNull)
+  description       String
+  quantity          Decimal          @db.Decimal(12, 3)
+  unit              String           @default("KG")
+  rate              Decimal          @db.Decimal(14, 2)
+  taxableValue      Decimal          @db.Decimal(14, 2)
+  taxAmount         Decimal          @db.Decimal(14, 2)
+  totalValue        Decimal          @db.Decimal(14, 2)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([creditNoteId])
+}
+
+// ── DEBIT NOTE ──────────────────────────────────────────────────────────────
+
+enum DebitNoteStatus {
+  ISSUED
+  CANCELLED
+}
+
+model DebitNote {
+  id     String   @id @default(cuid())
+  number String   @unique // DN-2026-0001
+  date   DateTime @default(now())
+
+  vendorBillId String
+  vendorBill   VendorBill @relation(fields: [vendorBillId], references: [id], onDelete: Restrict)
+
+  goodsReceiptId String
+  goodsReceipt   GoodsReceipt @relation(fields: [goodsReceiptId], references: [id], onDelete: Restrict)
+
+  vendorId String
+  vendor   Vendor @relation(fields: [vendorId], references: [id], onDelete: Restrict)
+
+  reason       String?
+  taxableValue Decimal         @default(0) @db.Decimal(14, 2)
+  taxAmount    Decimal         @default(0) @db.Decimal(14, 2)
+  totalValue   Decimal         @default(0) @db.Decimal(14, 2)
+  status       DebitNoteStatus @default(ISSUED)
+
+  createdById String?
+  createdBy   User?   @relation("DnCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+
+  lines DebitNoteLine[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([goodsReceiptId, vendorBillId])
+  @@index([vendorId])
+  @@index([vendorBillId])
+}
+
+model DebitNoteLine {
+  id          String    @id @default(cuid())
+  debitNoteId String
+  debitNote   DebitNote @relation(fields: [debitNoteId], references: [id], onDelete: Cascade)
+
+  grnLineId String?
+  grnLine   GoodsReceiptLine? @relation(fields: [grnLineId], references: [id], onDelete: SetNull)
+
+  materialId String
+  material   RawMaterial @relation(fields: [materialId], references: [id], onDelete: Restrict)
+
+  description  String
+  quantity     Decimal @db.Decimal(12, 3)
+  unit         String  @default("KG")
+  rate         Decimal @db.Decimal(14, 2)
+  taxPct       Decimal @default(18) @db.Decimal(5, 2)
+  taxableValue Decimal @db.Decimal(14, 2)
+  taxAmount    Decimal @db.Decimal(14, 2)
+  totalValue   Decimal @db.Decimal(14, 2)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([debitNoteId])
+  @@index([materialId])
+}
+
+enum AccountType {
+  ASSET
+  LIABILITY
+  EQUITY
+  REVENUE
+  EXPENSE
+}
+
+enum VendorBillBasis {
+  PO
+  GRN
+  MANUAL
+  SERVICE
+}
+
+enum VendorBillStatus {
+  DRAFT
+  PENDING_APPROVAL
+  APPROVED
+  PAID
+  PARTIALLY_PAID
+  VOID
+}
+
+enum PostingSide {
+  DEBIT
+  CREDIT
+}
+
+enum PostingSourceType {
+  VENDOR_BILL
+  SALES_INVOICE
+  PAYMENT
+  JOURNAL_ENTRY
+  STOCK_MOVEMENT
+  CREDIT_NOTE
+  DEBIT_NOTE
+}
+
+model ChartOfAccount {
+  id          String          @id @default(cuid())
+  code        String          @unique
+  name        String
+  type        AccountType
+  description String?
+  isActive    Boolean         @default(true)
+  postings    LedgerPosting[]
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  @@index([type])
+  @@index([isActive])
+}
+
+model LedgerPosting {
+  id                  String            @id @default(cuid())
+  accountId           String
+  account             ChartOfAccount    @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  side                PostingSide
+  amount              Decimal           @db.Decimal(14, 2)
+  sourceType          PostingSourceType
+  sourceId            String
+  postedAt            DateTime          @default(now())
+  remark              String?
+  vendorBillId        String?
+  vendorBill          VendorBill?       @relation(fields: [vendorBillId], references: [id], onDelete: Cascade)
+  voucherNo           String?
+  customerId          String?
+  customer            Customer?         @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  vendorId            String?
+  vendor              Vendor?           @relation(fields: [vendorId], references: [id], onDelete: SetNull)
+  reversalOfVoucherNo String?
+  createdAt           DateTime          @default(now())
+  updatedAt           DateTime          @updatedAt
+
+  @@index([accountId])
+  @@index([vendorBillId])
+  @@index([sourceType, sourceId])
+  @@index([postedAt])
+  @@index([voucherNo])
+  @@index([customerId, postedAt])
+  @@index([vendorId, postedAt])
+}
+
+model VoucherSequence {
+  id     String @id @default(cuid())
+  series String
+  year   Int
+  lastNo Int    @default(0)
+
+  @@unique([series, year])
+}
+
+model VendorBill {
+  id     String           @id @default(cuid())
+  code   String           @unique
+  status VendorBillStatus @default(DRAFT)
+  basis  VendorBillBasis
+
+  vendorId String
+  vendor   Vendor @relation(fields: [vendorId], references: [id], onDelete: Restrict)
+
+  purchaseOrderId String?
+  purchaseOrder   PurchaseOrder? @relation(fields: [purchaseOrderId], references: [id], onDelete: SetNull)
+
+  goodsReceiptId String?
+  goodsReceipt   GoodsReceipt? @relation(fields: [goodsReceiptId], references: [id], onDelete: SetNull)
+
+  billNo   String? // Vendor's invoice number
+  billDate DateTime  @default(now())
+  dueOn    DateTime?
+
+  subtotal      Decimal @default(0) @db.Decimal(14, 2)
+  taxAmount     Decimal @default(0) @db.Decimal(14, 2)
+  totalValue    Decimal @default(0) @db.Decimal(14, 2)
+  paidAmount    Decimal @default(0) @db.Decimal(14, 2)
+  debitedAmount Decimal @default(0) @db.Decimal(14, 2)
+
+  createdById String?
+  createdBy   User?   @relation("BillCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+
+  remark     String?
+  postings   LedgerPosting[]
+  debitNotes DebitNote[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([vendorId])
+  @@index([billDate])
+  @@index([createdById])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ITEM MANAGEMENT (BOM) MODULE
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum BomStatus {
+  DRAFT
+  PENDING_APPROVAL
+  APPROVED
+  REJECTED
+}
+
+enum OrderBomSource {
+  MAKE_TO_STOCK
+  MAKE_TO_ORDER
+}
+
+enum AmendmentStatus {
+  PENDING_APPROVAL
+  APPROVED
+  REJECTED
+}
+
+model StandardBom {
+  id     String    @id @default(cuid())
+  code   String    @unique // e.g. "BOM-STD-001"
+  status BomStatus @default(DRAFT)
+
+  materialId String
+  material   RawMaterial @relation(fields: [materialId], references: [id], onDelete: Restrict)
+
+  requestedById String
+  requestedBy   User      @relation("BomRequestedBy", fields: [requestedById], references: [id])
+  approvedById  String?
+  approvedBy    User?     @relation("BomApprovedBy", fields: [approvedById], references: [id])
+  approvedAt    DateTime?
+
+  lines     StandardBomLine[]
+  orderBoms OrderBom[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([materialId])
+}
+
+model StandardBomLine {
+  id    String      @id @default(cuid())
+  bomId String
+  bom   StandardBom @relation(fields: [bomId], references: [id], onDelete: Cascade)
+
+  materialId String // Component raw material
+  material   RawMaterial @relation(fields: [materialId], references: [id], onDelete: Restrict)
+
+  lineNo     Int
+  quantityKg Decimal @db.Decimal(12, 3)
+
+  @@index([bomId])
+}
+
+model OrderBom {
+  id     String         @id @default(cuid())
+  code   String         @unique // e.g. "BOM-ORD-001"
+  status BomStatus      @default(DRAFT)
+  source OrderBomSource
+
+  standardBomId String?
+  standardBom   StandardBom? @relation(fields: [standardBomId], references: [id], onDelete: SetNull)
+
+  lines      OrderBomLine[]
+  amendments BomAmendment[]
+
+  // Planning (PLN) relations
+  planningWorkOrders PlanningWorkOrder[]
+
+  // Direct Manufacturing (PRD) relations
+  directManufacturingWorkOrders DirectManufacturingWorkOrder[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+}
+
+model OrderBomLine {
+  id         String   @id @default(cuid())
+  orderBomId String
+  orderBom   OrderBom @relation(fields: [orderBomId], references: [id], onDelete: Cascade)
+
+  materialId String
+  material   RawMaterial @relation(fields: [materialId], references: [id], onDelete: Restrict)
+
+  lineNo     Int
+  quantityKg Decimal @db.Decimal(12, 3)
+
+  @@index([orderBomId])
+}
+
+model BomAmendment {
+  id     String          @id @default(cuid())
+  code   String          @unique // e.g. "BOM-AMD-001"
+  status AmendmentStatus @default(PENDING_APPROVAL)
+
+  orderBomId String
+  orderBom   OrderBom @relation(fields: [orderBomId], references: [id], onDelete: Cascade)
+
+  requestedById String
+  requestedBy   User      @relation("AmdRequestedBy", fields: [requestedById], references: [id])
+  approvedById  String?
+  approvedBy    User?     @relation("AmdApprovedBy", fields: [approvedById], references: [id])
+  approvedAt    DateTime?
+
+  lines BomAmendmentLine[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([orderBomId])
+}
+
+model BomAmendmentLine {
+  id          String       @id @default(cuid())
+  amendmentId String
+  amendment   BomAmendment @relation(fields: [amendmentId], references: [id], onDelete: Cascade)
+
+  materialId String
+  material   RawMaterial @relation(fields: [materialId], references: [id], onDelete: Restrict)
+
+  lineNo     Int
+  quantityKg Decimal @db.Decimal(12, 3)
+
+  @@index([amendmentId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PLANNING (PLN) MODULE
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum PlanningStatus {
+  DRAFT
+  PENDING_APPROVAL
+  APPROVED
+  REJECTED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum PlanningSource {
+  MAKE_TO_STOCK
+  MAKE_TO_ORDER
+}
+
+enum MilestoneStatus {
+  PENDING
+  COMPLETED
+}
+
+model PlanningWorkOrder {
+  id          String         @id @default(cuid())
+  code        String         @unique // e.g. "PWO-2026-0001"
+  status      PlanningStatus @default(DRAFT)
+  source      PlanningSource
+  referenceNo String? // e.g. Sales Order Code or Forecast ID
+
+  materialId String
+  material   RawMaterial @relation(fields: [materialId], references: [id], onDelete: Restrict)
+
+  quantityKg Decimal @db.Decimal(12, 3)
+
+  orderBomId String?
+  orderBom   OrderBom? @relation(fields: [orderBomId], references: [id], onDelete: SetNull)
+
+  requestedById String
+  requestedBy   User      @relation("PwoRequestedBy", fields: [requestedById], references: [id], onDelete: Restrict)
+  approvedById  String?
+  approvedBy    User?     @relation("PwoApprovedBy", fields: [approvedById], references: [id], onDelete: SetNull)
+  approvedAt    DateTime?
+
+  milestones  PlanningMilestone[]
+  allocations PlanningAllocation[]
+  shortages   PlanningShortage[]
+
+  // Stubs
+  productionWorkOrders ProductionWorkOrderPlaceholder[]
+  purchaseRequisitions PurchaseRequisitionPlaceholder[]
+  storeIssueSlips      StoreIssueSlipPlaceholder[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([materialId])
+}
+
+model PlanningMilestone {
+  id    String            @id @default(cuid())
+  pwoId String
+  pwo   PlanningWorkOrder @relation(fields: [pwoId], references: [id], onDelete: Cascade)
+
+  name        String
+  status      MilestoneStatus @default(PENDING)
+  dueDate     DateTime?
+  completedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([pwoId])
+}
+
+model PlanningAllocation {
+  id    String             @id @default(cuid())
+  pwoId String?
+  pwo   PlanningWorkOrder? @relation(fields: [pwoId], references: [id], onDelete: Cascade)
+
+  materialId String
+  material   RawMaterial @relation(fields: [materialId], references: [id], onDelete: Restrict)
+
+  batchId String
+  batch   InventoryBatch @relation(fields: [batchId], references: [id], onDelete: Restrict)
+
+  quantityKg Decimal @db.Decimal(12, 3)
+
+  createdAt DateTime @default(now())
+
+  @@index([pwoId])
+  @@index([materialId])
+  @@index([batchId])
+}
+
+model PlanningShortage {
+  id    String             @id @default(cuid())
+  pwoId String?
+  pwo   PlanningWorkOrder? @relation(fields: [pwoId], references: [id], onDelete: Cascade)
+
+  materialId String
+  material   RawMaterial @relation(fields: [materialId], references: [id], onDelete: Restrict)
+
+  requiredQtyKg  Decimal @db.Decimal(12, 3)
+  allocatedQtyKg Decimal @db.Decimal(12, 3)
+  shortageQtyKg  Decimal @db.Decimal(12, 3)
+
+  createdAt DateTime @default(now())
+
+  @@index([pwoId])
+  @@index([materialId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STUBS FOR DOWNSTREAM MODULES
+// ─────────────────────────────────────────────────────────────────────────────
+
+model ProductionWorkOrderPlaceholder {
+  id        String            @id @default(cuid())
+  pwoId     String            @unique
+  pwo       PlanningWorkOrder @relation(fields: [pwoId], references: [id], onDelete: Cascade)
+  status    String            @default("READY") // TODO: Replace with Production module actual structures
+  createdAt DateTime          @default(now())
+}
+
+model PurchaseRequisitionPlaceholder {
+  id    String             @id @default(cuid())
+  pwoId String?
+  pwo   PlanningWorkOrder? @relation(fields: [pwoId], references: [id], onDelete: Cascade)
+
+  materialId String
+  material   RawMaterial @relation(fields: [materialId], references: [id], onDelete: Restrict)
+
+  quantityKg Decimal  @db.Decimal(12, 3)
+  status     String   @default("PENDING") // TODO: Replace with Purchase module actual structures
+  createdAt  DateTime @default(now())
+
+  @@index([pwoId])
+}
+
+model StoreIssueSlipPlaceholder {
+  id        String            @id @default(cuid())
+  pwoId     String            @unique
+  pwo       PlanningWorkOrder @relation(fields: [pwoId], references: [id], onDelete: Cascade)
+  status    String            @default("PENDING") // TODO: Replace with Store module actual structures
+  createdAt DateTime          @default(now())
+}
+
+enum DirectManufacturingStatus {
+  DRAFT
+  IN_PROGRESS
+  PENDING_QC
+  COMPLETED
+  REJECTED
+}
+
+model DirectManufacturingWorkOrder {
+  id     String                    @id @default(cuid())
+  code   String                    @unique // e.g., "DMWO-2026-0001"
+  status DirectManufacturingStatus @default(DRAFT)
+
+  // Direct manufacturing inputs
+  orderBomId String
+  orderBom   OrderBom @relation(fields: [orderBomId], references: [id])
+
+  // Quantities
+  targetQtyKg Decimal  @db.Decimal(12, 3)
+  actualQtyKg Decimal? @db.Decimal(12, 3) // Yield on completion
+
+  // Staging / Process Entry worksheet fields
+  resourceId String?
+  resource   ProductionResource? @relation(fields: [resourceId], references: [id], onDelete: Restrict)
+  operatorId String?
+  operator   User?               @relation("DmwoOperator", fields: [operatorId], references: [id])
+  shift      String? // "Day", "Night"
+
+  // Generic worksheet fields
+  processLog String?
+  metrics    Json? // Array of dynamic key-value pairs: { label: string, value: string }[]
+
+  // Audit Convension signatures
+  createdById  String
+  createdBy    User    @relation("DmwoCreatedBy", fields: [createdById], references: [id])
+  approvedById String?
+  approvedBy   User?   @relation("DmwoApprovedBy", fields: [approvedById], references: [id])
+
+  // Downstream QC Gate Stub
+  qcPlaceholder QualityControlPlaceholder?
+
+  // Target warehouse destination for finished goods
+  warehouseId String
+  warehouse   Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  startedAt   DateTime?
+  completedAt DateTime?
+
+  @@index([status])
+  @@index([orderBomId])
+  @@index([warehouseId])
+  @@index([resourceId])
+}
+
+model QualityControlPlaceholder {
+  id          String                       @id @default(cuid())
+  dmwoId      String                       @unique
+  dmwo        DirectManufacturingWorkOrder @relation(fields: [dmwoId], references: [id], onDelete: Cascade)
+  status      String                       @default("PENDING") // PENDING, PASSED, FAILED
+  verdictById String?
+  verdictBy   User?                        @relation("QcVerdictBy", fields: [verdictById], references: [id], onDelete: SetNull)
+  verdictAt   DateTime?
+  notes       String?
+  createdAt   DateTime                     @default(now())
+  updatedAt   DateTime                     @default(now()) @updatedAt
+}
+
+model ProductionResource {
+  id         String                         @id @default(cuid())
+  name       String
+  code       String                         @unique // e.g. "LINE-1", "LINE-2"
+  type       String // e.g. "LINE", "MACHINE", "STATION"
+  isActive   Boolean                        @default(true)
+  workOrders DirectManufacturingWorkOrder[]
+  createdAt  DateTime                       @default(now())
+  updatedAt  DateTime                       @updatedAt
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// People and services: HRMS, engagement planning and service billing.
+// Used by service-provider tenants; manufacturing tenants leave these empty.
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum EmploymentStatus {
+  PROBATION
+  ACTIVE
+  NOTICE
+  EXITED
+}
+
+enum AttendanceStatus {
+  PRESENT
+  WFH
+  HALF_DAY
+  LEAVE
+  ABSENT
+  WEEKLY_OFF
+  HOLIDAY
+}
+
+enum LeaveType {
+  CASUAL
+  SICK
+  EARNED
+  COMP_OFF
+  UNPAID
+}
+
+enum LeaveStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+enum PayrollStatus {
+  DRAFT
+  PROCESSED
+  PAID
+}
+
+enum EngagementStatus {
+  PROPOSED
+  ACTIVE
+  ON_HOLD
+  COMPLETED
+}
+
+enum TaskStatus {
+  NOT_STARTED
+  IN_PROGRESS
+  BLOCKED
+  DONE
+}
+
+enum ServiceInvoiceStatus {
+  DRAFT
+  RAISED
+  PART_PAID
+  PAID
+  OVERDUE
+}
+
+model Employee {
+  id              String           @id @default(cuid())
+  code            String           @unique
+  name            String
+  email           String?
+  phone           String?
+  designation     String
+  department      String
+  grade           String?
+  location        String?
+  joinedOn        DateTime
+  status          EmploymentStatus @default(ACTIVE)
+  monthlyCtc      Decimal          @db.Decimal(12, 2)
+  billRatePerHour Decimal?         @db.Decimal(10, 2)
+  managerId       String?
+  manager         Employee?        @relation("Reports", fields: [managerId], references: [id], onDelete: SetNull)
+  reports         Employee[]       @relation("Reports")
+  userId          String?          @unique
+  user            User?            @relation(fields: [userId], references: [id], onDelete: SetNull)
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  attendance AttendanceRecord[]
+  leaves     LeaveRequest[]
+  payslips   PayrollLine[]
+  timesheets Timesheet[]
+  tasks      EngagementTask[]
+  managing   Engagement[]
+
+  @@index([department])
+  @@index([status])
+}
+
+model AttendanceRecord {
+  id         String           @id @default(cuid())
+  employeeId String
+  employee   Employee         @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  date       DateTime         @db.Date
+  status     AttendanceStatus
+  checkIn    DateTime?
+  checkOut   DateTime?
+
+  @@unique([employeeId, date])
+  @@index([date])
+}
+
+model LeaveRequest {
+  id          String      @id @default(cuid())
+  code        String      @unique
+  employeeId  String
+  employee    Employee    @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  type        LeaveType
+  fromDate    DateTime    @db.Date
+  toDate      DateTime    @db.Date
+  days        Decimal     @db.Decimal(4, 1)
+  reason      String?
+  status      LeaveStatus @default(PENDING)
+  decidedById String?
+  decidedBy   User?       @relation("LeaveDecidedBy", fields: [decidedById], references: [id], onDelete: SetNull)
+  decidedAt   DateTime?
+  createdAt   DateTime    @default(now())
+
+  @@index([status])
+  @@index([employeeId])
+}
+
+model PayrollRun {
+  id          String        @id @default(cuid())
+  code        String        @unique
+  month       DateTime      @db.Date
+  status      PayrollStatus @default(DRAFT)
+  processedAt DateTime?
+  paidAt      DateTime?
+  gross       Decimal       @db.Decimal(14, 2)
+  deductions  Decimal       @db.Decimal(14, 2)
+  net         Decimal       @db.Decimal(14, 2)
+  headcount   Int
+  lines       PayrollLine[]
+  createdAt   DateTime      @default(now())
+}
+
+model PayrollLine {
+  id              String     @id @default(cuid())
+  runId           String
+  run             PayrollRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  employeeId      String
+  employee        Employee   @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  paidDays        Decimal    @db.Decimal(4, 1)
+  basic           Decimal    @db.Decimal(12, 2)
+  hra             Decimal    @db.Decimal(12, 2)
+  allowances      Decimal    @db.Decimal(12, 2)
+  gross           Decimal    @db.Decimal(12, 2)
+  pf              Decimal    @db.Decimal(12, 2)
+  esi             Decimal    @db.Decimal(12, 2)
+  professionalTax Decimal    @db.Decimal(12, 2)
+  tds             Decimal    @db.Decimal(12, 2)
+  net             Decimal    @db.Decimal(12, 2)
+
+  @@unique([runId, employeeId])
+}
+
+model Engagement {
+  id            String           @id @default(cuid())
+  code          String           @unique
+  name          String
+  customerId    String
+  customer      Customer         @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  serviceLine   String
+  status        EngagementStatus @default(PROPOSED)
+  startOn       DateTime
+  endOn         DateTime
+  contractValue Decimal          @db.Decimal(14, 2)
+  budgetHours   Int
+  managerId     String?
+  manager       Employee?        @relation(fields: [managerId], references: [id], onDelete: SetNull)
+  description   String?
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+
+  tasks      EngagementTask[]
+  timesheets Timesheet[]
+  invoices   ServiceInvoice[]
+
+  @@index([status])
+  @@index([customerId])
+}
+
+model EngagementTask {
+  id           String     @id @default(cuid())
+  engagementId String
+  engagement   Engagement @relation(fields: [engagementId], references: [id], onDelete: Cascade)
+  wbs          String
+  name         String
+  assigneeId   String?
+  assignee     Employee?  @relation(fields: [assigneeId], references: [id], onDelete: SetNull)
+  status       TaskStatus @default(NOT_STARTED)
+  startOn      DateTime
+  endOn        DateTime
+  plannedHours Int
+  progressPct  Int        @default(0)
+  isMilestone  Boolean    @default(false)
+
+  timesheets Timesheet[]
+
+  @@index([engagementId])
+}
+
+model Timesheet {
+  id           String          @id @default(cuid())
+  employeeId   String
+  employee     Employee        @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  engagementId String
+  engagement   Engagement      @relation(fields: [engagementId], references: [id], onDelete: Cascade)
+  taskId       String?
+  task         EngagementTask? @relation(fields: [taskId], references: [id], onDelete: SetNull)
+  date         DateTime        @db.Date
+  hours        Decimal         @db.Decimal(4, 1)
+  billable     Boolean         @default(true)
+  approved     Boolean         @default(false)
+  note         String?
+
+  @@index([employeeId, date])
+  @@index([engagementId])
+}
+
+model ServiceInvoice {
+  id           String               @id @default(cuid())
+  code         String               @unique
+  customerId   String
+  customer     Customer             @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  engagementId String?
+  engagement   Engagement?          @relation(fields: [engagementId], references: [id], onDelete: SetNull)
+  invoiceDate  DateTime
+  dueOn        DateTime
+  description  String
+  subtotal     Decimal              @db.Decimal(14, 2)
+  taxAmount    Decimal              @db.Decimal(14, 2)
+  totalValue   Decimal              @db.Decimal(14, 2)
+  paidAmount   Decimal              @default(0) @db.Decimal(14, 2)
+  status       ServiceInvoiceStatus @default(RAISED)
+  createdAt    DateTime             @default(now())
+
+  @@index([status])
+  @@index([customerId])
+}

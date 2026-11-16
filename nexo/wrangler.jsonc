@@ -1,0 +1,39 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "nexo",
+	"main": ".open-next/worker.js",
+	"compatibility_date": "2026-10-01",
+	"compatibility_flags": [
+		"nodejs_compat",
+		"global_fetch_strictly_public"
+	],
+	"assets": {
+		"directory": ".open-next/assets",
+		"binding": "ASSETS"
+	},
+	"observability": {
+		"enabled": true
+	},
+	// Keeps the gzipped upload under the free plan's 3 MB limit (~3.2 MB unminified).
+	"minify": true,
+	// Needs the mavens.dev zone on this Cloudflare account; DNS record and cert are created on deploy.
+	"routes": [
+		{
+			"pattern": "app.nexo.mavens.dev",
+			"custom_domain": true
+		}
+	],
+	// AUTH_SECRET and SMTP_* are set with `wrangler secret put`.
+	"vars": {
+		"AUTH_TRUST_HOST": "true"
+	},
+	// id from `wrangler hyperdrive create nexo --connection-string=<prod DATABASE_URL>`.
+	// localConnectionString: local preview DB; also required by `opennextjs-cloudflare deploy`, which never connects to it.
+	"hyperdrive": [
+		{
+			"binding": "HYPERDRIVE",
+			"id": "8e225cae1a054b8cbc736156dc091318",
+			"localConnectionString": "postgresql://nexo:nexo@localhost:5432/nexo"
+		}
+	]
+}

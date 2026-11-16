@@ -1,0 +1,54 @@
+[33md3e4e6d0[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;31morigin/main[m[33m)[m implement packing list UI, package management, finalization, and print functionality
+src/app/(app)/sales/dispatch/[id]/packing-list-section.tsx
+src/app/(app)/sales/dispatch/[id]/page.tsx
+src/app/(app)/sales/flow/page.tsx
+src/app/(app)/sales/orders/[id]/page.tsx
+src/app/(app)/sales/packing-lists/[id]/packing-editor.tsx
+src/app/(app)/sales/packing-lists/[id]/page.tsx
+src/app/(app)/sales/packing-lists/[id]/print-button.tsx
+src/app/(app)/sales/packing-lists/packing-lists-grid.tsx
+src/app/(app)/sales/packing-lists/page.tsx
+src/components/ui/chip.tsx
+src/lib/chain.ts
+src/lib/nav.ts
+[33mff226114[m implement packing list flow with validations,concurrency handling,and tests
+nexo-before-packing.dump
+prisma/schema.prisma
+prisma/test-sales-day1-flow.ts
+prisma/test-sales-packing-list.ts
+src/app/(app)/sales/sales-actions.ts
+src/app/(app)/sales/sales-core.ts
+[33m0416ae63[m quotation rejection, credit limit locking, and multi-challan invoicing
+prisma/test-sales-day1-flow.ts
+prisma/test-sales-day6-7-negative.ts
+src/app/(app)/sales/dispatch/[id]/page.tsx
+src/app/(app)/sales/orders/[id]/page.tsx
+src/app/(app)/sales/quotations/[id]/quotation-actions.tsx
+src/app/(app)/sales/sales-actions.ts
+src/app/(app)/sales/sales-core.ts
+[33m92a17e99[m return credit postings, and invoice detail UI
+.eslintrc.json
+docs/sales-userflow.md
+package-lock.json
+package.json
+prisma/query-demo-data.ts
+prisma/test-sales-day6-7-negative.ts
+prisma/test-sales-day8-returns.ts
+src/app/(app)/sales/invoices/[id]/page.tsx
+src/app/(app)/sales/invoices/invoices-grid.tsx
+src/app/(app)/sales/sales-core.ts
+[33m42cc8ae7[m complete return and QC flow with invoice, tax, E2E, validity and order cancellation fixes
+package-lock.json
+package.json
+prisma/schema.prisma
+prisma/test-sales-day1-flow.ts
+prisma/test-sales-day3-invoice.ts
+prisma/test-sales-day6-7-e2e.ts
+prisma/test-sales-day6-7-negative.ts
+prisma/test-sales-day8-returns.ts
+src/app/(app)/sales/orders/[id]/page.tsx
+src/app/(app)/sales/orders/[id]/sales-order-actions.tsx
+src/app/(app)/sales/returns/[id]/page.tsx
+src/app/(app)/sales/returns/[id]/return-qc-panel.tsx
+src/app/(app)/sales/sales-actions.ts
+src/app/(app)/sales/sales-core.ts

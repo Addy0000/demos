@@ -1,0 +1,17 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "border-accent-on-rounded",
+        "value": "*",
+        "files": [
+          "src/components/dashboard/flow-map.tsx"
+        ],
+        "createdAt": "2026-11-11T11:26:09.548Z",
+        "reason": "Claude triage: L208 is a dashed connector line drawn with border-t, not a card; rounded-full applies only to the solid-line branch of the same ternary"
+      }
+    ]
+  }
+}
